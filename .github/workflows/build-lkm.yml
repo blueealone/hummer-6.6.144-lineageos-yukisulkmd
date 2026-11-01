@@ -14,7 +14,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: android15-6.6
-          key: kcache-v9
+          key: kcache-v10
 
       - name: Clang
         run: |
@@ -44,10 +44,11 @@ jobs:
           git -C android15-6.6 rev-parse HEAD
           ls -l android15-6.6/drivers/base/kernelFwUpdate
 
-      - name: Get device config
+      - name: Get device config (correct repo name)
         run: |
           set -eux
-          curl -L --retry 3 -o /tmp/kc "https://raw.githubusercontent.com/blueealone/hummer-6.6.144-lineageos-yukisulkmsd/main/kernel_config"
+          curl -L --retry 3 -o /tmp/kc \
+            "https://raw.githubusercontent.com/blueealone/hummer-6.6.144-lineageos-yukisulkmd/main/kernel_config"
           ls -l /tmp/kc
           LINES=$(wc -l < /tmp/kc)
           echo "lines=$LINES"
@@ -63,10 +64,7 @@ jobs:
           grep -E '^CONFIG_MODULES=' .config
           make ARCH=arm64 CC=clang LLVM=1 LLVM_IAS=1 modules_prepare
           grep -E '^CONFIG_MODULES=' include/config/auto.conf
-          echo "--- header exists? ---"
           ls -l arch/arm64/include/asm/compiler.h
-          echo "--- generated symlink check ---"
-          ls -l include/generated/ 2>/dev/null | head -5
           make ARCH=arm64 CC=clang LLVM=1 LLVM_IAS=1 kernelrelease
 
       - name: Build kernel
@@ -87,42 +85,22 @@ jobs:
           [ -f Module.symvers ] || cp vmlinux.symvers Module.symvers
           ls -lh vmlinux Module.symvers
 
-      - name: Patch YukiSU Kbuild with include paths
+      - name: Build YukiSU LKM (ARCH=arm64 is the key)
         run: |
           if [ ! -d YukiSU/.git ]; then
             git clone --depth=1 https://github.com/Anatdx/YukiSU.git
           fi
           cd YukiSU/kernel
-          # 关键修复：给 kbuild 加 arch/arm64 头文件搜索路径
-          head -5 Kbuild
-          if ! grep -q 'arch/arm64/include' Kbuild; then
-            printf '%s\n' \
-              '' \
-              '# --- patched by CI: add arch include paths ---' \
-              'ccflags-y += -I$(srctree)/arch/arm64/include' \
-              'ccflags-y += -I$(srctree)/arch/arm64/include/generated' \
-              'ccflags-y += -I$(objtree)/arch/arm64/include/generated' \
-              'ccflags-y += -I$(srctree)/include' \
-              'ccflags-y += -I$(objtree)/include' \
-              'asflags-y += -I$(srctree)/arch/arm64/include' \
-              'asflags-y += -I$(objtree)/arch/arm64/include/generated' \
-              > /tmp/kbuild_patch
-            cat /tmp/kbuild_patch >> Kbuild
-          fi
-          echo "=== patched head ==="
-          head -12 Kbuild
-
-      - name: Build YukiSU LKM
-        run: |
-          cd YukiSU/kernel
           export PATH=${{ github.workspace }}/tc/bin:$PATH
           K=${{ github.workspace }}/android15-6.6
           set +e
-          make CONFIG_KSU=m CONFIG_KSU_SUPERKEY=y CC=clang KDIR=$K > /tmp/ksu.log 2>&1
+          make ARCH=arm64 LLVM=1 LLVM_IAS=1 CC=clang \
+               CONFIG_KSU=m CONFIG_KSU_SUPERKEY=y \
+               KDIR=$K > /tmp/ksu.log 2>&1
           rc=$?
           set -e
           echo "yukisu exit=$rc"
-          tail -70 /tmp/ksu.log
+          tail -60 /tmp/ksu.log
           if [ $rc -ne 0 ]; then exit 1; fi
 
       - name: Collect
