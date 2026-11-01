@@ -1,112 +1,70 @@
-name: Build KernelSU LKM for LineageOS hummer
-
-on:
-  workflow_dispatch:
-    inputs:
-      ksu_variant:
-        description: 'KernelSU variant'
-        required: true
-        type: choice
-        default: 'sukisu'
-        options:
-          - 'sukisu'
-          - 'kernelsu-next'
-
+name: build-lkm
+on: [workflow_dispatch]
 jobs:
   build:
     runs-on: ubuntu-22.04
-    timeout-minutes: 60
-
+    timeout-minutes: 120
     steps:
-      - name: Target info
-        run: |
-          echo "Target kernel : 6.6.144-4k-g0c7e7eb67745"
-          echo "Source branch : lineage-23.2 (HEAD == device commit)"
-          echo "Variant       : ${{ inputs.ksu_variant }}"
-
-      - name: Install dependencies
+      - name: Deps
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq git curl bc bison flex \
-            libssl-dev libelf-dev lz4 zstd zip unzip lld patch \
-            python3 build-essential
+          sudo apt-get install -y -qq git curl bc bison flex libssl-dev libelf-dev lz4 zstd zip unzip lld patch python3 build-essential
 
-      - name: Download clang toolchain
+      - name: Clang
         run: |
-          mkdir -p toolchain && cd toolchain
-          curl -L --retry 3 -o clang.tar.gz \
-            "https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/main/clang-r522817.tar.gz"
-          tar -xzf clang.tar.gz
-          rm -f clang.tar.gz
+          mkdir -p tc && cd tc
+          curl -L --retry 3 -o c.tar.gz "https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/main/clang-r522817.tar.gz"
+          tar -xzf c.tar.gz && rm -f c.tar.gz
           echo "$(pwd)/bin" >> $GITHUB_PATH
           ./bin/clang --version | head -1
 
-      - name: Clone LineageOS kernel source
+      - name: Get device config
         run: |
-          # lineage-23.2 HEAD 精确等于设备运行内核 0c7e7eb67745
-          git clone --depth=1 --branch lineage-23.2 \
-            https://github.com/LineageOS/android_kernel_oneplus_sm8750.git kernel
-          cd kernel
-          echo "source HEAD : $(git rev-parse HEAD)"
-          echo "expect      : 0c7e7eb67745dfe25af521fefdaa7e384c66d00a"
+          curl -L --retry 3 -o device_config "https://raw.githubusercontent.com/blueealone/hummer-6.6.144-lineageos-yukisulkmsd/main/kernel_config"
+          wc -l device_config
 
-      - name: Inject KernelSU kernel source
+      - name: Clone kernel
         run: |
-          cd kernel
-          if [ "${{ inputs.ksu_variant }}" = "kernelsu-next" ]; then
-            curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh" | bash -
-          else
-            # SukiSU-Ultra 的 setup.sh：无参数时拉最新 tag
-            curl -LSs "https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU-Ultra/main/kernel/setup.sh" | bash -
-          fi
-          echo "=== drivers/kernelsu ==="
-          ls drivers/kernelsu/ | head -20
-          echo "=== Kconfig ==="
-          head -12 drivers/kernelsu/Kconfig
+          git clone --depth=1 --branch lineage-23.2 https://github.com/LineageOS/android_kernel_oneplus_sm8750.git KDIR
+          cd KDIR
+          echo "HEAD: $(git rev-parse HEAD)"
+          git config user.email a@b.c && git config user.name a
 
-      - name: Build LKM
+      - name: Configure + build kernel (for Module.symvers + vmlinux)
         run: |
-          cd kernel
-          # 直接用源码树默认配置生成 .config，再只编 kernelsu 模块
-          make ARCH=arm64 CC=clang LLVM=1 LLVM_IAS=1 gki_defconfig
-
-          # 确保 KSU 配置为模块模式
-          echo "CONFIG_KSU=m" >> .config
+          cd KDIR
+          cp ../device_config .config
           make ARCH=arm64 CC=clang LLVM=1 LLVM_IAS=1 olddefconfig
+          echo "--- kernelrelease ---"
+          make ARCH=arm64 kernelrelease
+          echo "--- building vmlinux + modules ---"
+          make -j$(nproc) ARCH=arm64 CC=clang LLVM=1 LLVM_IAS=1 vmlinux
+          make -j$(nproc) ARCH=arm64 CC=clang LLVM=1 LLVM_IAS=1 modules_prepare || true
+          ls -lh vmlinux Module.symvers
 
-          grep -E 'CONFIG_KSU' .config || echo "WARN: CONFIG_KSU not in .config"
-
-          # 只编 kernelsu 模块，固定 LOCALVERSION 避免 -dirty
-          make -j$(nproc) ARCH=arm64 CC=clang LLVM=1 LLVM_IAS=1 \
-               M=drivers/kernelsu modules \
-               LOCALVERSION="-4k-g0c7e7eb67745" 2>&1 | tail -40
-
-      - name: Verify and collect
+      - name: Build YukiSU LKM
         run: |
-          cd kernel
-          KO=$(find drivers/kernelsu -name '*.ko' | head -1)
-          if [ -z "$KO" ]; then
-            echo "❌ No .ko produced"
-            exit 1
-          fi
-          echo "found: $KO"
+          git clone --depth=1 https://github.com/Anatdx/YukiSU.git
+          cd YukiSU/kernel
+          export PATH=$(ls -d ${{ github.workspace }}/tc/bin):$PATH
+          make CONFIG_KSU=m CONFIG_KSU_SUPERKEY=y CC=clang KDIR=${{ github.workspace }}/KDIR 2>&1 | tail -40
+
+      - name: Check result
+        run: |
+          KO=$(find YukiSU/kernel -name 'kernelsu.ko' | head -1)
+          echo "KO=$KO"
+          if [ -z "$KO" ]; then echo "FAILED: no ko"; exit 1; fi
           ls -lh "$KO"
-          echo ""
           echo "=== vermagic ==="
           strings "$KO" | grep -E '^vermagic=|^name=' || true
-          echo ""
-          if strings "$KO" | grep -q 'vermagic=6.6.144-4k-g0c7e7eb67745 '; then
-            echo "✅ VERMAGIC MATCH — 可直接使用"
-          else
-            echo "⚠️ VERMAGIC MISMATCH — 需要用 apd insmod 或 lkmloader 强制加载"
-          fi
-          mkdir -p ../out
-          cp "$KO" ../out/kernelsu.ko
+          echo "=== __versions section size ==="
+          readelf -S "$KO" | grep -A1 versions || true
+          mkdir -p out
+          cp "$KO" out/kernelsu.ko
 
-      - name: Upload artifact
+      - name: Upload
         uses: actions/upload-artifact@v4
         with:
           name: kernelsu-ko
           path: out/kernelsu.ko
           if-no-files-found: error
-
