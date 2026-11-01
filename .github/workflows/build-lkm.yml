@@ -3,7 +3,7 @@ on: [workflow_dispatch]
 jobs:
   build:
     runs-on: ubuntu-22.04
-    timeout-minutes: 120
+    timeout-minutes: 360
     steps:
       - name: Deps
         run: |
@@ -18,49 +18,58 @@ jobs:
           echo "$(pwd)/bin" >> $GITHUB_PATH
           ./bin/clang --version | head -1
 
-      - name: Get device config
+      - name: Clone all repos (sibling layout required by symlinks)
+        run: |
+          git clone --depth=1 --branch lineage-23.2 https://github.com/LineageOS/android_kernel_oneplus_sm8750.git KDIR
+          git clone --depth=1 --branch lineage-23.2 https://github.com/LineageOS/android_kernel_oneplus_sm8750-modules.git sm8750-modules
+          git clone --depth=1 --branch lineage-23.2 https://github.com/LineageOS/android_kernel_oneplus_sm8750-devicetrees.git sm8750-devicetrees || echo "devicetrees clone failed (may be optional)"
+          echo "=== workspace ==="
+          ls -1
+          echo "=== symlink check ==="
+          ls -l KDIR/drivers/base/kernelFwUpdate
+          echo "=== target exists? ==="
+          ls sm8750-modules/oplus/kernel/touchpanel/kernelFwUpdate/ | head -5
+
+      - name: Device config
         run: |
           curl -L --retry 3 -o device_config "https://raw.githubusercontent.com/blueealone/hummer-6.6.144-lineageos-yukisulkmsd/main/kernel_config"
           wc -l device_config
 
-      - name: Clone kernel
-        run: |
-          git clone --depth=1 --branch lineage-23.2 https://github.com/LineageOS/android_kernel_oneplus_sm8750.git KDIR
-          cd KDIR
-          echo "HEAD: $(git rev-parse HEAD)"
-          git config user.email a@b.c && git config user.name a
-
-      - name: Configure + build kernel (for Module.symvers + vmlinux)
+      - name: Configure kernel
         run: |
           cd KDIR
           cp ../device_config .config
-          make ARCH=arm64 CC=clang LLVM=1 LLVM_IAS=1 olddefconfig
+          make ARCH=arm64 CC=clang LLVM=1 LLVM_IAS=1 olddefconfig 2>&1 | tail -20
           echo "--- kernelrelease ---"
-          make ARCH=arm64 kernelrelease
-          echo "--- building vmlinux + modules ---"
-          make -j$(nproc) ARCH=arm64 CC=clang LLVM=1 LLVM_IAS=1 vmlinux
-          make -j$(nproc) ARCH=arm64 CC=clang LLVM=1 LLVM_IAS=1 modules_prepare || true
+          make ARCH=arm64 CC=clang LLVM=1 LLVM_IAS=1 kernelrelease
+
+      - name: Build kernel (needed for Module.symvers)
+        run: |
+          cd KDIR
+          echo "start: $(date -u +%H:%M:%S)"
+          make -j$(nproc) ARCH=arm64 CC=clang LLVM=1 LLVM_IAS=1 2>&1 | tail -25
+          echo "end: $(date -u +%H:%M:%S)"
           ls -lh vmlinux Module.symvers
+          echo "Module.symvers lines: $(wc -l < Module.symvers)"
 
       - name: Build YukiSU LKM
         run: |
           git clone --depth=1 https://github.com/Anatdx/YukiSU.git
           cd YukiSU/kernel
-          export PATH=$(ls -d ${{ github.workspace }}/tc/bin):$PATH
+          export PATH=${{ github.workspace }}/tc/bin:$PATH
           make CONFIG_KSU=m CONFIG_KSU_SUPERKEY=y CC=clang KDIR=${{ github.workspace }}/KDIR 2>&1 | tail -40
 
       - name: Check result
         run: |
           KO=$(find YukiSU/kernel -name 'kernelsu.ko' | head -1)
-          echo "KO=$KO"
           if [ -z "$KO" ]; then echo "FAILED: no ko"; exit 1; fi
+          echo "KO=$KO"
           ls -lh "$KO"
           echo "=== vermagic ==="
           strings "$KO" | grep -E '^vermagic=|^name=' || true
-          echo "=== __versions section size ==="
-          readelf -S "$KO" | grep -A1 versions || true
-          mkdir -p out
-          cp "$KO" out/kernelsu.ko
+          echo "=== versions section ==="
+          readelf -S "$KO" | grep -A1 -i versions || true
+          mkdir -p out && cp "$KO" out/kernelsu.ko
 
       - name: Upload
         uses: actions/upload-artifact@v4
