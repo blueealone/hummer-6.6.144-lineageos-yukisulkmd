@@ -18,57 +18,66 @@ jobs:
           echo "$(pwd)/bin" >> $GITHUB_PATH
           ./bin/clang --version | head -1
 
-      - name: Clone all repos (sibling layout required by symlinks)
+      - name: Clone all repos (sibling layout)
         run: |
           git clone --depth=1 --branch lineage-23.2 https://github.com/LineageOS/android_kernel_oneplus_sm8750.git KDIR
           git clone --depth=1 --branch lineage-23.2 https://github.com/LineageOS/android_kernel_oneplus_sm8750-modules.git sm8750-modules
-          git clone --depth=1 --branch lineage-23.2 https://github.com/LineageOS/android_kernel_oneplus_sm8750-devicetrees.git sm8750-devicetrees || echo "devicetrees clone failed (may be optional)"
-          echo "=== workspace ==="
-          ls -1
-          echo "=== symlink check ==="
+          git clone --depth=1 --branch lineage-23.2 https://github.com/LineageOS/android_kernel_oneplus_sm8750-devicetrees.git sm8750-devicetrees || true
           ls -l KDIR/drivers/base/kernelFwUpdate
-          echo "=== target exists? ==="
-          ls sm8750-modules/oplus/kernel/touchpanel/kernelFwUpdate/ | head -5
+          ls sm8750-modules/oplus/kernel/touchpanel/kernelFwUpdate/ | head -3
 
       - name: Device config
         run: |
-          curl -L --retry 3 -o device_config "https://raw.githubusercontent.com/blueealone/hummer-6.6.144-lineageos-yukisulkmsd/main/kernel_config"
-          wc -l device_config
+          curl -L --retry 3 -o kernel_config "https://raw.githubusercontent.com/blueealone/hummer-6.6.144-lineageos-yukisulkmsd/main/kernel_config"
+          wc -l kernel_config
 
-      - name: Configure kernel
+      - name: Configure
         run: |
           cd KDIR
-          cp ../device_config .config
-          make ARCH=arm64 CC=clang LLVM=1 LLVM_IAS=1 olddefconfig 2>&1 | tail -20
-          echo "--- kernelrelease ---"
+          cp ../kernel_config .config
+          make ARCH=arm64 CC=clang LLVM=1 LLVM_IAS=1 olddefconfig 2>&1 | tail -10
           make ARCH=arm64 CC=clang LLVM=1 LLVM_IAS=1 kernelrelease
 
-      - name: Build kernel (needed for Module.symvers)
+      - name: Build kernel
         run: |
           cd KDIR
           echo "start: $(date -u +%H:%M:%S)"
-          make -j$(nproc) ARCH=arm64 CC=clang LLVM=1 LLVM_IAS=1 2>&1 | tail -25
-          echo "end: $(date -u +%H:%M:%S)"
-          ls -lh vmlinux Module.symvers
-          echo "Module.symvers lines: $(wc -l < Module.symvers)"
+          make -j$(nproc) ARCH=arm64 CC=clang LLVM=1 LLVM_IAS=1 2>&1 | tail -30
+          rc=${PIPESTATUS[0]}
+          echo "end: $(date -u +%H:%M:%S)  make exit=$rc"
+          ls -lh vmlinux 2>/dev/null || true
+          ls -lh vmlinux.symvers Module.symvers 2>/dev/null || true
+          # vmlinux.symvers 就是完整编译产生的符号 CRC 表
+          if [ ! -f Module.symvers ] && [ -f vmlinux.symvers ]; then
+            cp vmlinux.symvers Module.symvers
+          fi
+          echo "--- symvers ---"
+          if [ -f Module.symvers ]; then
+            echo "Module.symvers lines: $(wc -l < Module.symvers)"
+            head -3 Module.symvers
+          else
+            echo "FATAL: no symvers file"
+            exit 1
+          fi
 
       - name: Build YukiSU LKM
         run: |
           git clone --depth=1 https://github.com/Anatdx/YukiSU.git
           cd YukiSU/kernel
           export PATH=${{ github.workspace }}/tc/bin:$PATH
-          make CONFIG_KSU=m CONFIG_KSU_SUPERKEY=y CC=clang KDIR=${{ github.workspace }}/KDIR 2>&1 | tail -40
+          make CONFIG_KSU=m CONFIG_KSU_SUPERKEY=y CC=clang \
+               KDIR=${{ github.workspace }}/KDIR 2>&1 | tail -40
 
       - name: Check result
         run: |
           KO=$(find YukiSU/kernel -name 'kernelsu.ko' | head -1)
-          if [ -z "$KO" ]; then echo "FAILED: no ko"; exit 1; fi
+          if [ -z "$KO" ]; then echo "FAILED: no ko produced"; exit 1; fi
           echo "KO=$KO"
           ls -lh "$KO"
           echo "=== vermagic ==="
           strings "$KO" | grep -E '^vermagic=|^name=' || true
           echo "=== versions section ==="
-          readelf -S "$KO" | grep -A1 -i versions || true
+          readelf -S "$KO" | grep -A2 -i versions || echo "(no versions section)"
           mkdir -p out && cp "$KO" out/kernelsu.ko
 
       - name: Upload
