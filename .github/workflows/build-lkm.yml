@@ -18,66 +18,94 @@ jobs:
           echo "$(pwd)/bin" >> $GITHUB_PATH
           ./bin/clang --version | head -1
 
-      - name: Clone all repos (sibling layout)
+      - name: Clone repos (sibling layout, correct KMI dirname)
         run: |
-          git clone --depth=1 --branch lineage-23.2 https://github.com/LineageOS/android_kernel_oneplus_sm8750.git KDIR
-          git clone --depth=1 --branch lineage-23.2 https://github.com/LineageOS/android_kernel_oneplus_sm8750-modules.git sm8750-modules
-          git clone --depth=1 --branch lineage-23.2 https://github.com/LineageOS/android_kernel_oneplus_sm8750-devicetrees.git sm8750-devicetrees || true
-          ls -l KDIR/drivers/base/kernelFwUpdate
+          # 目录名必须是 android15-6.6，YukiSU 用它当 KMI
+          git clone --depth=1 --branch lineage-23.2 \
+            https://github.com/LineageOS/android_kernel_oneplus_sm8750.git android15-6.6
+          git clone --depth=1 --branch lineage-23.2 \
+            https://github.com/LineageOS/android_kernel_oneplus_sm8750-modules.git sm8750-modules
+          git clone --depth=1 --branch lineage-23.2 \
+            https://github.com/LineageOS/android_kernel_oneplus_sm8750-devicetrees.git sm8750-devicetrees || true
+          echo "=== HEAD ==="
+          git -C android15-6.6 rev-parse HEAD
+          echo "=== symlink ==="
+          ls -l android15-6.6/drivers/base/kernelFwUpdate
           ls sm8750-modules/oplus/kernel/touchpanel/kernelFwUpdate/ | head -3
 
-      - name: Device config
+      - name: Configure + verify CONFIG_MODULES
         run: |
-          curl -L --retry 3 -o kernel_config "https://raw.githubusercontent.com/blueealone/hummer-6.6.144-lineageos-yukisulkmsd/main/kernel_config"
-          wc -l kernel_config
-
-      - name: Configure
-        run: |
-          cd KDIR
-          cp ../kernel_config .config
-          make ARCH=arm64 CC=clang LLVM=1 LLVM_IAS=1 olddefconfig 2>&1 | tail -10
+          set -x
+          cd android15-6.6
+          curl -L --retry 3 -o /tmp/kc "https://raw.githubusercontent.com/blueealone/hummer-6.6.144-lineageos-yukisulkmsd/main/kernel_config"
+          wc -l /tmp/kc
+          cp /tmp/kc .config
+          echo "--- input has MODULES? ---"
+          grep -E '^CONFIG_MODULES=' .config || echo "INPUT MISSING CONFIG_MODULES"
+          make ARCH=arm64 CC=clang LLVM=1 LLVM_IAS=1 olddefconfig
+          echo "--- after olddefconfig ---"
+          grep -E '^CONFIG_MODULES=|^# CONFIG_MODULES' .config || echo "LOST AFTER OLDDEFCONFIG"
+          if ! grep -q '^CONFIG_MODULES=y' .config; then
+            echo ">>> forcing CONFIG_MODULES=y"
+            sed -i 's/^# CONFIG_MODULES is not set/CONFIG_MODULES=y/' .config
+            grep -q '^CONFIG_MODULES=y' .config || echo 'CONFIG_MODULES=y' >> .config
+            make ARCH=arm64 CC=clang LLVM=1 LLVM_IAS=1 olddefconfig
+          fi
+          echo "--- modules_prepare (generates auto.conf) ---"
+          make ARCH=arm64 CC=clang LLVM=1 LLVM_IAS=1 modules_prepare
+          echo "--- auto.conf check ---"
+          grep -E '^CONFIG_MODULES=' include/config/auto.conf || echo "AUTO.CONF MISSING MODULES"
+          echo "--- kernelrelease ---"
           make ARCH=arm64 CC=clang LLVM=1 LLVM_IAS=1 kernelrelease
 
       - name: Build kernel
         run: |
-          cd KDIR
+          cd android15-6.6
           echo "start: $(date -u +%H:%M:%S)"
-          make -j$(nproc) ARCH=arm64 CC=clang LLVM=1 LLVM_IAS=1 2>&1 | tail -30
-          rc=${PIPESTATUS[0]}
+          set +e
+          make -j$(nproc) ARCH=arm64 CC=clang LLVM=1 LLVM_IAS=1 > /tmp/build.log 2>&1
+          rc=$?
+          set -e
           echo "end: $(date -u +%H:%M:%S)  make exit=$rc"
-          ls -lh vmlinux 2>/dev/null || true
-          ls -lh vmlinux.symvers Module.symvers 2>/dev/null || true
-          # vmlinux.symvers 就是完整编译产生的符号 CRC 表
-          if [ ! -f Module.symvers ] && [ -f vmlinux.symvers ]; then
-            cp vmlinux.symvers Module.symvers
-          fi
-          echo "--- symvers ---"
-          if [ -f Module.symvers ]; then
-            echo "Module.symvers lines: $(wc -l < Module.symvers)"
-            head -3 Module.symvers
-          else
-            echo "FATAL: no symvers file"
+          echo "--- last 30 lines ---"
+          tail -30 /tmp/build.log
+          if [ $rc -ne 0 ]; then
+            echo "=== BUILD FAILED ==="
+            grep -iE 'error|fatal' /tmp/build.log | tail -20
             exit 1
           fi
+          ls -lh vmlinux
+          # 完整编译产出的是 vmlinux.symvers
+          if [ ! -f Module.symvers ] && [ -f vmlinux.symvers ]; then
+            cp vmlinux.symvers Module.symvers
+            echo "copied vmlinux.symvers -> Module.symvers"
+          fi
+          echo "symvers lines: $(wc -l < Module.symvers 2>/dev/null || echo 0)"
 
       - name: Build YukiSU LKM
         run: |
           git clone --depth=1 https://github.com/Anatdx/YukiSU.git
           cd YukiSU/kernel
           export PATH=${{ github.workspace }}/tc/bin:$PATH
+          set +e
           make CONFIG_KSU=m CONFIG_KSU_SUPERKEY=y CC=clang \
-               KDIR=${{ github.workspace }}/KDIR 2>&1 | tail -40
+               KDIR=${{ github.workspace }}/android15-6.6 > /tmp/ksu.log 2>&1
+          rc=$?
+          set -e
+          echo "yukisu make exit=$rc"
+          tail -50 /tmp/ksu.log
+          if [ $rc -ne 0 ]; then exit 1; fi
 
       - name: Check result
         run: |
           KO=$(find YukiSU/kernel -name 'kernelsu.ko' | head -1)
-          if [ -z "$KO" ]; then echo "FAILED: no ko produced"; exit 1; fi
+          if [ -z "$KO" ]; then echo "FAILED: no ko"; exit 1; fi
           echo "KO=$KO"
           ls -lh "$KO"
           echo "=== vermagic ==="
           strings "$KO" | grep -E '^vermagic=|^name=' || true
-          echo "=== versions section ==="
-          readelf -S "$KO" | grep -A2 -i versions || echo "(no versions section)"
+          echo "=== versions ==="
+          readelf -S "$KO" | grep -A2 -i versions || echo "(none)"
           mkdir -p out && cp "$KO" out/kernelsu.ko
 
       - name: Upload
