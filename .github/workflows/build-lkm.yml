@@ -10,107 +10,129 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y -qq git curl bc bison flex libssl-dev libelf-dev lz4 zstd zip unzip lld patch python3 build-essential
 
+      - name: Cache kernel build
+        uses: actions/cache@v4
+        with:
+          path: |
+            android15-6.6
+            ccache
+          key: kernel-${{ github.run_id }}
+          restore-keys: |
+            kernel-
+
       - name: Clang
         run: |
-          mkdir -p tc && cd tc
-          curl -L --retry 3 -o c.tar.gz "https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/main/clang-r522817.tar.gz"
-          tar -xzf c.tar.gz && rm -f c.tar.gz
-          echo "$(pwd)/bin" >> $GITHUB_PATH
-          ./bin/clang --version | head -1
+          if [ ! -d tc/bin ]; then
+            mkdir -p tc && cd tc
+            curl -L --retry 3 -o c.tar.gz "https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/main/clang-r522817.tar.gz"
+            tar -xzf c.tar.gz && rm -f c.tar.gz
+            cd ..
+          fi
+          echo "${{ github.workspace }}/tc/bin" >> $GITHUB_PATH
+          ./tc/bin/clang --version | head -1
 
-      - name: Clone repos (sibling layout, correct KMI dirname)
+      - name: Clone repos
         run: |
-          # 目录名必须是 android15-6.6，YukiSU 用它当 KMI
-          git clone --depth=1 --branch lineage-23.2 \
-            https://github.com/LineageOS/android_kernel_oneplus_sm8750.git android15-6.6
-          git clone --depth=1 --branch lineage-23.2 \
-            https://github.com/LineageOS/android_kernel_oneplus_sm8750-modules.git sm8750-modules
-          git clone --depth=1 --branch lineage-23.2 \
-            https://github.com/LineageOS/android_kernel_oneplus_sm8750-devicetrees.git sm8750-devicetrees || true
-          echo "=== HEAD ==="
+          if [ ! -d android15-6.6/.git ]; then
+            git clone --depth=1 --branch lineage-23.2 \
+              https://github.com/LineageOS/android_kernel_oneplus_sm8750.git android15-6.6
+          fi
+          if [ ! -d sm8750-modules/.git ]; then
+            git clone --depth=1 --branch lineage-23.2 \
+              https://github.com/LineageOS/android_kernel_oneplus_sm8750-modules.git sm8750-modules
+          fi
+          # devicetrees 若已存在则跳过
+          if [ ! -d sm8750-devicetrees/.git ]; then
+            git clone --depth=1 --branch lineage-23.2 \
+              https://github.com/LineageOS/android_kernel_oneplus_sm8750-devicetrees.git sm8750-devicetrees || true
+          fi
           git -C android15-6.6 rev-parse HEAD
-          echo "=== symlink ==="
           ls -l android15-6.6/drivers/base/kernelFwUpdate
-          ls sm8750-modules/oplus/kernel/touchpanel/kernelFwUpdate/ | head -3
 
-      - name: Configure + verify CONFIG_MODULES
+      - name: Configure (verbose, fails loudly)
         run: |
-          set -x
+          set -eux
           cd android15-6.6
           curl -L --retry 3 -o /tmp/kc "https://raw.githubusercontent.com/blueealone/hummer-6.6.144-lineageos-yukisulkmsd/main/kernel_config"
           wc -l /tmp/kc
           cp /tmp/kc .config
-          echo "--- input has MODULES? ---"
-          grep -E '^CONFIG_MODULES=' .config || echo "INPUT MISSING CONFIG_MODULES"
+          echo "=== input check ==="
+          grep -E '^CONFIG_MODULES=' .config
           make ARCH=arm64 CC=clang LLVM=1 LLVM_IAS=1 olddefconfig
-          echo "--- after olddefconfig ---"
-          grep -E '^CONFIG_MODULES=|^# CONFIG_MODULES' .config || echo "LOST AFTER OLDDEFCONFIG"
-          if ! grep -q '^CONFIG_MODULES=y' .config; then
-            echo ">>> forcing CONFIG_MODULES=y"
-            sed -i 's/^# CONFIG_MODULES is not set/CONFIG_MODULES=y/' .config
-            grep -q '^CONFIG_MODULES=y' .config || echo 'CONFIG_MODULES=y' >> .config
-            make ARCH=arm64 CC=clang LLVM=1 LLVM_IAS=1 olddefconfig
-          fi
-          echo "--- modules_prepare (generates auto.conf) ---"
+          echo "=== after olddefconfig ==="
+          grep -E '^CONFIG_MODULES=' .config || { echo "LOST, forcing"; sed -i 's/^# CONFIG_MODULES is not set/CONFIG_MODULES=y/' .config; grep -q '^CONFIG_MODULES=y' .config || echo 'CONFIG_MODULES=y' >> .config; make ARCH=arm64 CC=clang LLVM=1 LLVM_IAS=1 olddefconfig; }
+          grep -E '^CONFIG_MODULES=' .config
+          echo "=== modules_prepare ==="
           make ARCH=arm64 CC=clang LLVM=1 LLVM_IAS=1 modules_prepare
-          echo "--- auto.conf check ---"
-          grep -E '^CONFIG_MODULES=' include/config/auto.conf || echo "AUTO.CONF MISSING MODULES"
-          echo "--- kernelrelease ---"
+          echo "=== auto.conf ==="
+          grep -E '^CONFIG_MODULES=' include/config/auto.conf || { echo "AUTO.CONF LOST"; exit 1; }
+          echo "=== arch/arm64/include/asm/compiler.h ==="
+          ls -l arch/arm64/include/asm/compiler.h
+          echo "=== kernelrelease ==="
           make ARCH=arm64 CC=clang LLVM=1 LLVM_IAS=1 kernelrelease
 
-      - name: Build kernel
+      - name: Build kernel (skip if vmlinux exists)
         run: |
           cd android15-6.6
+          if [ -f vmlinux ] && [ -f Module.symvers ]; then
+            echo "cached: vmlinux + Module.symvers present, skip build"
+            ls -lh vmlinux Module.symvers
+            exit 0
+          fi
+          export CCACHE_DIR=${{ github.workspace }}/ccache
+          export PATH=${{ github.workspace }}/tc/bin:$PATH
           echo "start: $(date -u +%H:%M:%S)"
           set +e
-          make -j$(nproc) ARCH=arm64 CC=clang LLVM=1 LLVM_IAS=1 > /tmp/build.log 2>&1
+          make -j$(nproc) ARCH=arm64 CC="ccache clang" LLVM=1 LLVM_IAS=1 > /tmp/build.log 2>&1
           rc=$?
           set -e
-          echo "end: $(date -u +%H:%M:%S)  make exit=$rc"
-          echo "--- last 30 lines ---"
-          tail -30 /tmp/build.log
-          if [ $rc -ne 0 ]; then
-            echo "=== BUILD FAILED ==="
-            grep -iE 'error|fatal' /tmp/build.log | tail -20
-            exit 1
-          fi
-          ls -lh vmlinux
-          # 完整编译产出的是 vmlinux.symvers
-          if [ ! -f Module.symvers ] && [ -f vmlinux.symvers ]; then
-            cp vmlinux.symvers Module.symvers
-            echo "copied vmlinux.symvers -> Module.symvers"
-          fi
-          echo "symvers lines: $(wc -l < Module.symvers 2>/dev/null || echo 0)"
+          echo "end: $(date -u +%H:%M:%S)  exit=$rc"
+          tail -25 /tmp/build.log
+          if [ $rc -ne 0 ]; then grep -iE 'error|fatal' /tmp/build.log | tail -20; exit 1; fi
+          [ -f Module.symvers ] || cp vmlinux.symvers Module.symvers
+          ls -lh vmlinux Module.symvers
 
-      - name: Build YukiSU LKM
+      - name: Build YukiSU LKM (explicit include paths)
         run: |
-          git clone --depth=1 https://github.com/Anatdx/YukiSU.git
+          if [ ! -d YukiSU/.git ]; then
+            git clone --depth=1 https://github.com/Anatdx/YukiSU.git
+          fi
           cd YukiSU/kernel
           export PATH=${{ github.workspace }}/tc/bin:$PATH
+          K=${{ github.workspace }}/android15-6.6
           set +e
-          make CONFIG_KSU=m CONFIG_KSU_SUPERKEY=y CC=clang \
-               KDIR=${{ github.workspace }}/android15-6.6 > /tmp/ksu.log 2>&1
+          make CONFIG_KSU=m CONFIG_KSU_SUPERKEY=y CC=clang KDIR=$K \
+               KBUILD_EXTRA_CPPFLAGS="-I$K/arch/arm64/include -I$K/arch/arm64/include/generated -I$K/include" \
+               > /tmp/ksu.log 2>&1
           rc=$?
           set -e
-          echo "yukisu make exit=$rc"
-          tail -50 /tmp/ksu.log
+          echo "yukisu exit=$rc"
+          tail -60 /tmp/ksu.log
           if [ $rc -ne 0 ]; then exit 1; fi
 
-      - name: Check result
+      - name: Collect
         run: |
+          mkdir -p out
           KO=$(find YukiSU/kernel -name 'kernelsu.ko' | head -1)
-          if [ -z "$KO" ]; then echo "FAILED: no ko"; exit 1; fi
-          echo "KO=$KO"
-          ls -lh "$KO"
-          echo "=== vermagic ==="
-          strings "$KO" | grep -E '^vermagic=|^name=' || true
-          echo "=== versions ==="
-          readelf -S "$KO" | grep -A2 -i versions || echo "(none)"
-          mkdir -p out && cp "$KO" out/kernelsu.ko
+          if [ -n "$KO" ]; then
+            cp "$KO" out/kernelsu.ko
+            echo "=== vermagic ==="
+            strings out/kernelsu.ko | grep -E '^vermagic=|^name=' || true
+            echo "=== versions ==="
+            readelf -S out/kernelsu.ko | grep -A2 -i versions || echo "(none)"
+          else
+            echo "no ko produced"
+          fi
+          # 内核构建产物单独上传，失败时也不丢
+          ls -lh android15-6.6/vmlinux android15-6.6/Module.symvers 2>/dev/null || true
+          cp android15-6.6/vmlinux out/ 2>/dev/null || true
+          cp android15-6.6/Module.symvers out/ 2>/dev/null || true
+          cp -r android15-6.6/include/generated out/generated 2>/dev/null || true
 
-      - name: Upload
+      - name: Upload everything
         uses: actions/upload-artifact@v4
+        if: always()
         with:
-          name: kernelsu-ko
-          path: out/kernelsu.ko
-          if-no-files-found: error
+          name: build-output
+          path: out/
+          if-no-files-found: warn
